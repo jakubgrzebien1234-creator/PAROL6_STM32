@@ -14,7 +14,7 @@ extern void UART_Direct_Send(const uint8_t* data);
 extern void PAROL6_TOOL_CHANGE_ELECTRIC();
 extern void PAROL6_EGRIP();
 extern void PAROL6_EGRIP_INIT();
-
+int VALVE_DELAY;
 void Parse_And_Execute_Command(uint8_t* data)
 {
     int id;

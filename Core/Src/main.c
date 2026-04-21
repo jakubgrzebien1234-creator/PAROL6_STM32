@@ -32,13 +32,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include "homing.h"
 #include "PAROL6.h"
 #include "uart.h"
 #include "startup.h"
 #include "Variables_OT.h"
-#include "Variables_GLOBAL.h" // Upewnij się, że tu trafią przeniesione zmienne
+#include "Variables_GLOBAL.h"
 #include "math.h"
+#include "CONFIG.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -74,7 +77,6 @@ static void MPU_Config(void);
 /* USER CODE BEGIN PFP */
 void Parse_And_Execute_Command(uint8_t* data);
 void SPI_WaitReady(void);
-/* Prototypy funkcji używanych z innych modułów */
 uint8_t send_message_dma(UART_HandleTypeDef* huart, const uint8_t* msg, uint16_t len);
 void UART_Direct_Send(const uint8_t* data);
 void Handle_Limit_Switches_Loop(void);
@@ -85,17 +87,14 @@ void Handle_ESTOP(void);
 /* USER CODE BEGIN 0 */
 void CheckLimitSwitchesOnStartup(void)
 {
-    // Tablice zmiennych stanu i wiadomości
     uint8_t* states[6] = {&s_j1, &s_j2, &s_j3, &s_j4, &s_j5, &s_j6};
     const uint8_t* msg_H[6] = {msg_h1, msg_h2, msg_h3, msg_h4, msg_h5, msg_h6};
     const uint8_t* msg_R[6] = {msg_r1, msg_r2, msg_r3, msg_r4, msg_r5, msg_r6};
 
     for (int i = 0; i < 6; i++)
     {
-        // Odczyt stanu pinu
         GPIO_PinState pinState = HAL_GPIO_ReadPin(limit_switch_ports[i], limit_switch_pins[i]);
 
-        // Jeśli pin zwarty do masy (GND) -> zazwyczaj wciśnięty
         if (pinState == GPIO_PIN_RESET)
         {
             *states[i] = 1;
@@ -112,15 +111,12 @@ void CheckLimitSwitchesOnStartup(void)
 
 void Handle_Position_Reporting(void)
 {
-    // Sprawdzamy co 20ms
     if (HAL_GetTick() - last_pos_report_time < 20) return;
 
     last_pos_report_time = HAL_GetTick();
 
-    // Wyślij pozycję TYLKO dla jednego silnika w tym obiegu pętli
     PAROL6_POSITION(current_report_motor_id);
 
-    // Przejdź do następnego silnika w kolejnym cyklu
     current_report_motor_id++;
     if (current_report_motor_id >= 6) {
         current_report_motor_id = 0;
@@ -186,13 +182,11 @@ int main(void)
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_8, GPIO_PIN_SET);
     CheckLimitSwitchesOnStartup();
 
-    // --- Start UART IT ---
     if (HAL_UARTEx_ReceiveToIdle_IT(&huart8, rx_buffer, RX_BUFFER_SIZE) != HAL_OK)
       {
           Error_Handler();
       }
 
-    // --- Start UART5 IT (NOWY) ---
 
       if (HAL_UARTEx_ReceiveToIdle_IT(&huart5, rx_buffer5, RX_BUFFER_SIZE) != HAL_OK)
       {
@@ -215,9 +209,9 @@ int main(void)
   /* USER CODE BEGIN WHILE */
       while (1)
       {
-          // 1. Zawsze sprawdzaj stan przycisku
+    	  if(ESTOP_Present){
           Handle_ESTOP();
-          // 2. Zawsze odbieraj UART (żeby nie zapchać bufora!)
+    	  }
           if (new_message_flag)
           {
               __disable_irq();
@@ -225,11 +219,10 @@ int main(void)
               memset(temp, 0, RX_BUFFER_SIZE);
               memcpy(temp, received_data, RX_BUFFER_SIZE);
               temp[RX_BUFFER_SIZE - 1] = 0;
-              new_message_flag = 0; // Skasuj flagę, odblokuj UART
+              new_message_flag = 0;
               __enable_irq();
 
-              // Wykonaj komendę TYLKO jeśli NIE MA awarii
-              if (ESTOP_TRIGGER == 0)
+              if (ESTOP_TRIGGER == 0 || ESTOP_Present == false)
               {
                   Parse_And_Execute_Command((uint8_t*)temp);
               }
@@ -244,24 +237,25 @@ int main(void)
                 new_message_flag5 = 0;
                 __enable_irq();
 
-                // Wykonujemy tę samą logikę co dla UART8
-                if (ESTOP_TRIGGER == 0) {
+                if (ESTOP_TRIGGER == 0 || ESTOP_Present == false)
+                {
                 	Parse_And_Execute_Command((uint8_t*)temp5);
-               }
+                }
 
 
           }
 
-          // 3. Logika maszyny - TYLKO GDY JEST BEZPIECZNIE (TRIGGER == 0)
-          if (ESTOP_TRIGGER == 0)
+          if (ESTOP_TRIGGER == 0 || ESTOP_Present == false)
           {
               HomeAll_Handler();
 
 
-              if(system_configured)
+              if(system_configured == 0 || System_Configured_Command_Present == false)
               {
                   Handle_Limit_Switches_Loop();
+                  if(Electric_Gripper_Present){
                   PAROL6_EGRIP_PROCESS();
+                  }
 
                   if(HAL_GetTick() - limitTimer > 50){
                       limitTimer = HAL_GetTick();
@@ -274,34 +268,30 @@ int main(void)
                       homing_command = 0;
                   }
 
-                  // W pętli while(1):
-
-                  // Jeśli mamy podciśnienie (cisnienie jest np. -0.5)
+                  if(Vacuum_Sensor_Present){
                   if (cisnienie < 0.0f)
                   {
                       if (HAL_GetTick() - adc_timer >= 50)
                       {
                           adc_timer = HAL_GetTick();
-                          HAL_ADC_Start_IT(&hadc1); // Restart pomiaru
+                          HAL_ADC_Start_IT(&hadc1);
 
-                          // Wyśle np.: P:-0.45
                           sprintf(msg, "P:%.2f\r\n", cisnienie);
                           UART_Direct_Send((uint8_t*)msg);
                       }
-                      cisnienie_stan = 1; // Zapamiętujemy, że "coś się działo"
+                      cisnienie_stan = 1;
                   }
-                  // Jeśli cisnienie wynosi 0.0 (bo filtr w ADC je wyzerował)
+
                   else
                   {
-                      // Jeśli wcześniej było podciśnienie (flaga == 1), to wyślij raz P:0.0
+
                       if (cisnienie_stan == 1)
                       {
                           sprintf(msg, "P:0.0\r\n");
                           UART_Direct_Send((uint8_t*)msg);
-                          cisnienie_stan = 0; // Reset flagi, żeby nie spamować zerami
+                          cisnienie_stan = 0;
                       }
 
-                      // Mimo że jest 0, musimy co jakiś czas "kopać" ADC, żeby mierzyło w tle
                       if (HAL_GetTick() - adc_timer >= 50)
                       {
                            adc_timer = HAL_GetTick();
@@ -309,11 +299,13 @@ int main(void)
                       }
                   }
 
-                  if (tool_changer_active) {
+              }
+
+                  if (tool_changer_active && Tool_Change_Present) {
                       PAROL6_TOOL_CHANGE();
                   }
 
-                  if(VGripStatus)
+                  if(VGripStatus && Vacuum_Gripper_Present)
                   {
                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 500);
                        if(cisnienie > PUMP_ON_PRESSURE)      HAL_GPIO_WritePin(PUMP_GPIO_Port, PUMP_Pin, GPIO_PIN_SET);
@@ -325,25 +317,22 @@ int main(void)
                        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
                   }
 
-                  // Raportowanie statusu (PROT)
+
+
+                 if(STM_Protect_Present){
                   if(HAL_GetTick() - protTimer > 100)
                   {
                       protTimer = HAL_GetTick();
-
-                      // Zmienna statyczna przechowuje ostatni WYSŁANY stan
                       static SystemStatus_t lastSentStatus = {0};
 
                       SystemStatus_t statusSnapshot;
 
-                      // Bezpieczne skopiowanie aktualnego stanu
                       __disable_irq();
                       memcpy(&statusSnapshot, &currentStatus, sizeof(SystemStatus_t));
                       __enable_irq();
 
-                      // Flaga decydująca czy wysłać dane
                       uint8_t shouldSend = 0;
 
-                      // 1. Sprawdzenie flag cyfrowych
                       if (statusSnapshot.powergood_3v3 != lastSentStatus.powergood_3v3 ||
                           statusSnapshot.powergood_5v  != lastSentStatus.powergood_5v  ||
                           statusSnapshot.power_ok      != lastSentStatus.power_ok      ||
@@ -352,7 +341,6 @@ int main(void)
                           shouldSend = 1;
                       }
 
-                      // 2. Sprawdzenie temperatur
                       if (!shouldSend)
                       {
                           if (fabsf(statusSnapshot.temp1 - lastSentStatus.temp1) > TEMP_THRESHOLD ||
@@ -364,7 +352,6 @@ int main(void)
                           }
                       }
 
-                      // Jeśli wykryto istotną zmianę -> wyślij i zaktualizuj historię
                       if (shouldSend)
                       {
                           char msg[128];
@@ -380,15 +367,14 @@ int main(void)
                                  );
                           UART_Direct_Send((uint8_t*)msg);
 
-                          // Zapisz ten stan jako ostatnio wysłany
+
                           memcpy(&lastSentStatus, &statusSnapshot, sizeof(SystemStatus_t));
                       }
 
                       PAROL6_MOTOR_CONNECTED();
 
                   }
-
-                  // Raportowanie pozycji
+                  }
                   if(HAL_GetTick() - positionTimer >= 50) {
                       positionTimer = HAL_GetTick();
                       float angles[6];
@@ -409,12 +395,12 @@ int main(void)
                           for(int i=0; i<6; i++) prev_angles[i] = angles[i];
                       }
                   }
-              } // End system_configured
+              }
           }
-          // 4. Jeśli JEST AWARIA (TRIGGER == 1)
+
           else
           {
-              HAL_Delay(10); // Odciąż procesor, UART działa w tle
+              HAL_Delay(10);
           }
 
     /* USER CODE END WHILE */
@@ -491,7 +477,6 @@ void UART_Direct_Send(const uint8_t* data)
     UART5_Send_Internal(data);
 }
 
-// Handler pustego bufora nadawczego dla UART8
 void UART_TX_Empty_Handler(void)
 {
     if (tx_head != tx_tail)
@@ -505,7 +490,6 @@ void UART_TX_Empty_Handler(void)
     }
 }
 
-// Handler pustego bufora nadawczego dla UART5
 void UART5_TX_Empty_Handler(void)
 {
     if (tx_head5 != tx_tail5)
@@ -519,7 +503,6 @@ void UART5_TX_Empty_Handler(void)
     }
 }
 
-// --- 5. Główna logika (Wysyłanie + Przypisanie do zmiennej) ---
 void Process_Pin_State(GPIO_TypeDef* GPIOx, uint16_t GPIO_Pin, const uint8_t* msg_high, const uint8_t* msg_low, uint8_t* state_variable)
 {
     if (HAL_GPIO_ReadPin(GPIOx, GPIO_Pin) == GPIO_PIN_SET)
@@ -534,7 +517,6 @@ void Process_Pin_State(GPIO_TypeDef* GPIOx, uint16_t GPIO_Pin, const uint8_t* ms
     }
 }
 
-// --- Nowa, minimalna obsługa przerwania ---
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == GPIO_PIN_15)
